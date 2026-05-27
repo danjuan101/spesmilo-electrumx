@@ -118,6 +118,14 @@ class SessionReferences:
 class SessionManager:
     '''Holds global state about all sessions.'''
 
+    # Hard cap on the number of confirmed history entries returned to
+    # the client by `scripthash.get_history` for very active addresses
+    # (the `most_recent=True` path in `limited_history`).  Sized to fit
+    # comfortably within aiorpcX's `max_response_size` (1MB by default)
+    # once each entry is JSON-encoded (~99 bytes) and the surrounding
+    # JSON-RPC envelope + mempool entries are added on top.
+    RECENT_HISTORY_LIMIT = 1000
+
     def __init__(
             self,
             env: 'Env',
@@ -147,6 +155,14 @@ class SessionManager:
         self._history_cache = pylru.lrucache(1000)
         self._history_lookups = 0
         self._history_hits = 0
+        # Separate cache for the "most recent N" history path used by
+        # scripthash.get_history.  Kept apart from `_history_cache` so
+        # that the full-history results consumed by address_status
+        # (status hash) are never mixed with the truncated results
+        # returned to clients.
+        self._recent_history_cache = pylru.lrucache(1000)
+        self._recent_history_lookups = 0
+        self._recent_history_hits = 0
         self._tx_hashes_cache = pylru.lrucache(1000)
         self._tx_hashes_lookups = 0
         self._tx_hashes_hits = 0
@@ -346,6 +362,9 @@ class SessionManager:
             'groups': len(self.session_groups),
             'history cache': cache_fmt.format(
                 self._history_lookups, self._history_hits, len(self._history_cache)),
+            'recent history cache': cache_fmt.format(
+                self._recent_history_lookups, self._recent_history_hits,
+                len(self._recent_history_cache)),
             'merkle cache': cache_fmt.format(
                 self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
             'pid': os.getpid(),
@@ -779,24 +798,45 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def limited_history(self, hashX):
-        '''Returns a pair (history, cost).
+    async def limited_history(self, hashX, *, most_recent=False):
+        '''Returns (history, cost).  history is earliest-first
+        (tx_hash, height) tuples, or RPCError.
 
-        History is a sorted list of (tx_hash, height) tuples, or an RPCError.'''
-        # History DoS limit.  Each element of history is about 99 bytes when encoded
-        # as JSON.
-        limit = self.env.max_send // 99
+        most_recent=False: full history required; raises if too large
+        (address_status / subscribe must hash the complete history).
+
+        most_recent=True: return newest RECENT_HISTORY_LIMIT entries
+        for scripthash.get_history on very active addresses.'''
+        # ~99 bytes/entry in JSON; used as full-history read cap and
+        # "history too large" threshold.
+        full_history_limit = self.env.max_send // 99
         cost = 0.1
-        self._history_lookups += 1
+        if most_recent:
+            # Truncated path sends rows to the client; max_send//99 would
+            # exceed aiorpcX max_response_size once JSON wrapper is added.
+            limit = self.RECENT_HISTORY_LIMIT
+            self._recent_history_lookups += 1
+            cache = self._recent_history_cache
+        else:
+            limit = full_history_limit
+            self._history_lookups += 1
+            cache = self._history_cache
         try:
-            result = self._history_cache[hashX]
-            self._history_hits += 1
+            result = cache[hashX]
+            if most_recent:
+                self._recent_history_hits += 1
+            else:
+                self._history_hits += 1
         except KeyError:
-            result = await self.db.limited_history(hashX, limit=limit)
+            result = await self.db.limited_history(
+                hashX, limit=limit, most_recent=most_recent)
             cost += 0.1 + len(result) * 0.001
-            if len(result) >= limit:
+            # Only the full-history path treats hitting the limit as an
+            # error: the truncated path intentionally returns the newest
+            # `limit` rows as a graceful degradation.
+            if not most_recent and len(result) >= limit:
                 result = RPCError(BAD_REQUEST, f'history too large', cost=cost)
-            self._history_cache[hashX] = result
+            cache[hashX] = result
 
         if isinstance(result, Exception):
             raise result
@@ -807,10 +847,11 @@ class SessionManager:
         height_changed = height != self.notified_height
         if height_changed:
             await self._refresh_hsub_results(height)
-            # Invalidate our history cache for touched hashXs
-            cache = self._history_cache
-            for hashX in set(cache).intersection(touched):
-                del cache[hashX]
+            # Invalidate both history caches for touched hashXs so the
+            # next request sees the newly confirmed transactions.
+            for cache in (self._history_cache, self._recent_history_cache):
+                for hashX in set(cache).intersection(touched):
+                    del cache[hashX]
 
         for session in self.sessions:
             await self._task_group.spawn(session.notify, touched, height_changed)
@@ -1174,8 +1215,13 @@ class ElectrumX(SessionBase):
         return result
 
     async def confirmed_and_unconfirmed_history(self, hashX):
-        # Note history is ordered but unconfirmed is unordered in e-s
-        history, cost = await self.session_mgr.limited_history(hashX)
+        # Note history is ordered but unconfirmed is unordered in e-s.
+        # Pass most_recent=True so an address with a huge history is
+        # truncated to the newest `limit` confirmed entries instead of
+        # erroring out; ordering remains earliest-first as required by
+        # the Electrum protocol.
+        history, cost = await self.session_mgr.limited_history(
+            hashX, most_recent=True)
         self.bump_cost(cost)
         conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
                 for tx_hash, height in history]

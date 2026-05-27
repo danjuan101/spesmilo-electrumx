@@ -208,21 +208,46 @@ class History:
 
         self.logger.info(f'backing up removed {nremoves:,d} history entries')
 
-    def get_txnums(self, hashX, limit=1000):
-        '''Generator that returns an unpruned, sorted list of tx_nums in the
-        history of a hashX.  Includes both spending and receiving
-        transactions.  By default yields at most 1000 entries.  Set
-        limit to None to get them all.  '''
+    def get_txnums(self, hashX, limit=1000, *, reverse=False):
+        '''Generator that yields tx_nums from the history of a hashX.
+
+        Includes both spending and receiving transactions.  By default
+        yields at most 1000 entries.  Set limit to None to get them all.
+
+        When reverse=False (default), yields entries earliest-first
+        (oldest tx_num first).  When reverse=True, yields entries
+        latest-first (newest tx_num first); use this when only the most
+        recent N entries are wanted under a small `limit`.
+
+        Storage layout reminder: rows are keyed by `hashX + flush_id`
+        (big-endian uint16), where larger flush_id means later in time.
+        Within a single row's value, tx_nums are stored in
+        chronological (earliest-first) order.  To get true newest-first
+        order, both the outer row iteration AND the inner per-row scan
+        must be reversed.'''
         limit = util.resolve_limit(limit)
         chunks = util.chunks
         txnum_padding = bytes(8-TXNUM_LEN)
-        for _key, hist in self.db.iterator(prefix=hashX):
-            for tx_numb in chunks(hist, TXNUM_LEN):
-                if limit == 0:
-                    return
-                tx_num, = unpack_le_uint64(tx_numb + txnum_padding)
-                yield tx_num
-                limit -= 1
+        if reverse:
+            # Walk rows newest-first, and within each row walk tx_nums
+            # newest-first as well so the combined stream is strictly
+            # newest -> oldest.
+            for _key, hist in self.db.iterator(prefix=hashX, reverse=True):
+                for offset in range(len(hist) - TXNUM_LEN, -1, -TXNUM_LEN):
+                    if limit == 0:
+                        return
+                    tx_numb = hist[offset:offset + TXNUM_LEN]
+                    tx_num, = unpack_le_uint64(tx_numb + txnum_padding)
+                    yield tx_num
+                    limit -= 1
+        else:
+            for _key, hist in self.db.iterator(prefix=hashX):
+                for tx_numb in chunks(hist, TXNUM_LEN):
+                    if limit == 0:
+                        return
+                    tx_num, = unpack_le_uint64(tx_numb + txnum_padding)
+                    yield tx_num
+                    limit -= 1
 
     #
     # History compaction
