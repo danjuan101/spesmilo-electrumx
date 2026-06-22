@@ -159,6 +159,7 @@ class SessionManager:
         self.hsub_results = None
         self._task_group = TaskGroup()
         self._sslc = None
+        self._ssl_cert_mtimes = None
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = Event()
         self.session_event = Event()
@@ -172,8 +173,34 @@ class SessionManager:
     def _ssl_context(self):
         if self._sslc is None:
             self._sslc = ssl.SSLContext(ssl.PROTOCOL_TLS)
-            self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
+            self._reload_ssl_context()
         return self._sslc
+
+    def _ssl_cert_mtime_pair(self):
+        return (
+            os.stat(self.env.ssl_certfile).st_mtime_ns,
+            os.stat(self.env.ssl_keyfile).st_mtime_ns,
+        )
+
+    def _reload_ssl_context(self):
+        self._sslc.load_cert_chain(self.env.ssl_certfile, keyfile=self.env.ssl_keyfile)
+        self._ssl_cert_mtimes = self._ssl_cert_mtime_pair()
+        self.logger.info(
+            f'loaded SSL certificate from {self.env.ssl_certfile} '
+            f'and key from {self.env.ssl_keyfile}'
+        )
+
+    async def _reload_ssl_context_on_change(self):
+        '''Reload the SSL certificate for new handshakes after cert renewal.'''
+        while True:
+            await sleep(60)
+            try:
+                mtimes = self._ssl_cert_mtime_pair()
+                if mtimes != self._ssl_cert_mtimes:
+                    self._reload_ssl_context()
+                    self.logger.info('reloaded SSL certificate after file change')
+            except (FileNotFoundError, PermissionError, ssl.SSLError) as e:
+                self.logger.error(f'failed to reload SSL certificate: {e}')
 
     async def _start_servers(self, services):
         for service in services:
@@ -633,6 +660,8 @@ class SessionManager:
             # because we connect to ourself
             async with self._task_group as group:
                 await group.spawn(self.peer_mgr.discover_peers())
+                if {service.protocol for service in self.env.services}.intersection(self.env.SSL_PROTOCOLS):
+                    await group.spawn(self._reload_ssl_context_on_change())
                 await group.spawn(self._clear_stale_sessions())
                 await group.spawn(self._handle_chain_reorgs())
                 await group.spawn(self._recalc_concurrency())
