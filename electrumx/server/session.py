@@ -118,9 +118,6 @@ class SessionReferences:
 class SessionManager:
     '''Holds global state about all sessions.'''
 
-    # Max confirmed entries for scripthash.get_history (~99 B/entry JSON; fits 1MB response).
-    RECENT_HISTORY_LIMIT = 1000
-
     def __init__(
             self,
             env: 'Env',
@@ -789,23 +786,16 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def limited_history(self, hashX, *, most_recent=False):
+    async def limited_history(self, hashX, *, limit=1000, most_recent=False):
         '''Returns (history, cost).  history is earliest-first
         (tx_hash, height) tuples, or RPCError.
 
-        most_recent=False: full history required; raises if too large
-        (address_status / subscribe must hash the complete history).
-
-        most_recent=True: return newest RECENT_HISTORY_LIMIT entries
-        for scripthash.get_history on very active addresses.'''
-        # ~99 bytes/entry in JSON; used as full-history read cap and
-        # "history too large" threshold.
+        most_recent=False: full history up to max_send//99; raises if too large
+        (address_status / subscribe).  most_recent=True: newest `limit` entries
+        (default 1000) for scripthash.get_history truncation.'''
         full_history_limit = self.env.max_send // 99
         cost = 0.1
         if most_recent:
-            # Truncated path sends rows to the client; max_send//99 would
-            # exceed aiorpcX max_response_size once JSON wrapper is added.
-            limit = self.RECENT_HISTORY_LIMIT
             self._recent_history_lookups += 1
             cache = self._recent_history_cache
         else:
@@ -1204,11 +1194,8 @@ class ElectrumX(SessionBase):
         return result
 
     async def confirmed_and_unconfirmed_history(self, hashX):
-        # Note history is ordered but unconfirmed is unordered in e-s.
-        # Pass most_recent=True so an address with a huge history is
-        # truncated to the newest `limit` confirmed entries instead of
-        # erroring out; ordering remains earliest-first as required by
-        # the Electrum protocol.
+        # most_recent=True: confirmed tail only (earliest-first, limit entries).
+        # Return order unchanged: confirmed block first, then unordered mempool entries appended.
         history, cost = await self.session_mgr.limited_history(
             hashX, most_recent=True)
         self.bump_cost(cost)
