@@ -118,12 +118,7 @@ class SessionReferences:
 class SessionManager:
     '''Holds global state about all sessions.'''
 
-    # Hard cap on the number of confirmed history entries returned to
-    # the client by `scripthash.get_history` for very active addresses
-    # (the `most_recent=True` path in `limited_history`).  Sized to fit
-    # comfortably within aiorpcX's `max_response_size` (1MB by default)
-    # once each entry is JSON-encoded (~99 bytes) and the surrounding
-    # JSON-RPC envelope + mempool entries are added on top.
+    # Max confirmed entries for scripthash.get_history (~99 B/entry JSON; fits 1MB response).
     RECENT_HISTORY_LIMIT = 1000
 
     def __init__(
@@ -155,11 +150,7 @@ class SessionManager:
         self._history_cache = pylru.lrucache(1000)
         self._history_lookups = 0
         self._history_hits = 0
-        # Separate cache for the "most recent N" history path used by
-        # scripthash.get_history.  Kept apart from `_history_cache` so
-        # that the full-history results consumed by address_status
-        # (status hash) are never mixed with the truncated results
-        # returned to clients.
+        # Truncated get_history cache; must not mix with _history_cache (address_status).
         self._recent_history_cache = pylru.lrucache(1000)
         self._recent_history_lookups = 0
         self._recent_history_hits = 0
@@ -828,8 +819,7 @@ class SessionManager:
             else:
                 self._history_hits += 1
         except KeyError:
-            result = await self.db.limited_history(
-                hashX, limit=limit, most_recent=most_recent)
+            result = await self.db.limited_history(hashX, limit=limit, most_recent=most_recent)
             cost += 0.1 + len(result) * 0.001
             # Only the full-history path treats hitting the limit as an
             # error: the truncated path intentionally returns the newest
@@ -847,8 +837,7 @@ class SessionManager:
         height_changed = height != self.notified_height
         if height_changed:
             await self._refresh_hsub_results(height)
-            # Invalidate both history caches for touched hashXs so the
-            # next request sees the newly confirmed transactions.
+            # Invalidate our history cache for touched hashXs
             for cache in (self._history_cache, self._recent_history_cache):
                 for hashX in set(cache).intersection(touched):
                     del cache[hashX]
