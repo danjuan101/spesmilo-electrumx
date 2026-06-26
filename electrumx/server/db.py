@@ -492,14 +492,14 @@ class DB:
 
         return [self.coin.header_hash(header) for header in headers]
 
-    async def limited_history(self, hashX, *, limit=1000, most_recent=False):
+    async def limited_history(self, hashX, *, limit=1000, latest_first=False):
         '''Return an unpruned, sorted list of (tx_hash, height) tuples of
         confirmed transactions that touched the address, earliest in
         the blockchain first.  Includes both spending and receiving
         transactions.  By default returns at most 1000 entries.  Set
         limit to None to get them all.
 
-        When most_recent=True, the `limit` is applied to the newest
+        When latest_first=True, the `limit` is applied to the newest
         entries instead of the oldest ones (useful for very active
         addresses whose full history is too large to ship to a client).
         The returned ordering is still earliest-first so callers that
@@ -507,12 +507,12 @@ class DB:
         computation, etc.) keep working unchanged.
         '''
         def read_history():
-            # Walk the DB newest-first when most_recent is requested so
+            # Walk the DB newest-first when latest_first is requested so
             # we stop after collecting the `limit` latest tx_nums, then
             # reverse the slice to restore earliest-first ordering.
             tx_nums = list(self.history.get_txnums(
-                hashX, limit, reverse=most_recent))
-            if most_recent:
+                hashX, limit, latest_first=latest_first))
+            if latest_first:
                 tx_nums.reverse()
             fs_tx_hash = self.fs_tx_hash
             return [fs_tx_hash(tx_num) for tx_num in tx_nums]

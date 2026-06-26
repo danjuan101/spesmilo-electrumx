@@ -208,16 +208,16 @@ class History:
 
         self.logger.info(f'backing up removed {nremoves:,d} history entries')
 
-    def get_txnums(self, hashX, limit=1000, *, reverse=False):
+    def get_txnums(self, hashX, limit=1000, *, latest_first=False):
         '''Generator that yields tx_nums from the history of a hashX.
 
         Includes both spending and receiving transactions.  By default
         yields at most 1000 entries.  Set limit to None to get them all.
 
-        When reverse=False (default), yields entries earliest-first
-        (oldest tx_num first).  When reverse=True, yields entries
-        latest-first (newest tx_num first); use this when only the most
-        recent N entries are wanted under a small `limit`.
+        When latest_first=False (default), yields tx_nums in chronological
+        order (oldest first).  When latest_first=True, yields tx_nums in
+        reverse chronological order (newest first), stopping after `limit`
+        entries.
 
         Storage layout reminder: rows are keyed by `hashX + flush_id`
         (big-endian uint16), where larger flush_id means later in time.
@@ -228,7 +228,7 @@ class History:
         limit = util.resolve_limit(limit)
         chunks = util.chunks
         txnum_padding = bytes(8-TXNUM_LEN)
-        if reverse:
+        if latest_first:
             # Walk rows newest-first, and within each row walk tx_nums
             # newest-first as well so the combined stream is strictly
             # newest -> oldest.

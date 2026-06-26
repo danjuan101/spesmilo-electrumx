@@ -786,16 +786,16 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def limited_history(self, hashX, *, limit=1000, most_recent=False):
+    async def limited_history(self, hashX, *, limit=1000, latest_first=False):
         '''Returns (history, cost).  history is earliest-first
         (tx_hash, height) tuples, or RPCError.
 
-        most_recent=False: full history up to max_send//99; raises if too large
-        (address_status / subscribe).  most_recent=True: newest `limit` entries
+        latest_first=False: full history up to max_send//99; raises if too large
+        (address_status / subscribe).  latest_first=True: newest `limit` entries
         (default 1000) for scripthash.get_history truncation.'''
         full_history_limit = self.env.max_send // 99
         cost = 0.1
-        if most_recent:
+        if latest_first:
             self._recent_history_lookups += 1
             cache = self._recent_history_cache
         else:
@@ -804,17 +804,17 @@ class SessionManager:
             cache = self._history_cache
         try:
             result = cache[hashX]
-            if most_recent:
+            if latest_first:
                 self._recent_history_hits += 1
             else:
                 self._history_hits += 1
         except KeyError:
-            result = await self.db.limited_history(hashX, limit=limit, most_recent=most_recent)
+            result = await self.db.limited_history(hashX, limit=limit, latest_first=latest_first)
             cost += 0.1 + len(result) * 0.001
             # Only the full-history path treats hitting the limit as an
             # error: the truncated path intentionally returns the newest
             # `limit` rows as a graceful degradation.
-            if not most_recent and len(result) >= limit:
+            if not latest_first and len(result) >= limit:
                 result = RPCError(BAD_REQUEST, f'history too large', cost=cost)
             cache[hashX] = result
 
@@ -1194,10 +1194,10 @@ class ElectrumX(SessionBase):
         return result
 
     async def confirmed_and_unconfirmed_history(self, hashX):
-        # most_recent=True: confirmed tail only (earliest-first, limit entries).
+        # latest_first=True: confirmed tail only (earliest-first, limit entries).
         # Return order unchanged: confirmed block first, then unordered mempool entries appended.
         history, cost = await self.session_mgr.limited_history(
-            hashX, most_recent=True)
+            hashX, latest_first=True)
         self.bump_cost(cost)
         conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
                 for tx_hash, height in history]
