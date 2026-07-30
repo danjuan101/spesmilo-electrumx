@@ -147,6 +147,10 @@ class SessionManager:
         self._history_cache = pylru.lrucache(1000)
         self._history_lookups = 0
         self._history_hits = 0
+        # Truncated get_history cache; must not mix with _history_cache (address_status).
+        self._recent_history_cache = pylru.lrucache(1000)
+        self._recent_history_lookups = 0
+        self._recent_history_hits = 0
         self._tx_hashes_cache = pylru.lrucache(1000)
         self._tx_hashes_lookups = 0
         self._tx_hashes_hits = 0
@@ -346,6 +350,9 @@ class SessionManager:
             'groups': len(self.session_groups),
             'history cache': cache_fmt.format(
                 self._history_lookups, self._history_hits, len(self._history_cache)),
+            'recent history cache': cache_fmt.format(
+                self._recent_history_lookups, self._recent_history_hits,
+                len(self._recent_history_cache)),
             'merkle cache': cache_fmt.format(
                 self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
             'pid': os.getpid(),
@@ -779,24 +786,40 @@ class SessionManager:
         self.txs_sent += 1
         return hex_hash
 
-    async def limited_history(self, hashX):
+    async def limited_history(self, hashX, *, limit=1000, latest_first=False):
         '''Returns a pair (history, cost).
 
-        History is a sorted list of (tx_hash, height) tuples, or an RPCError.'''
+        History is a sorted list of (tx_hash, height) tuples, or an RPCError.
+
+        latest_first=False: full history up to max_send//99; raises if too large
+        (address_status / subscribe).  latest_first=True: newest `limit` entries
+        (default 1000) for scripthash.get_history truncation.'''
         # History DoS limit.  Each element of history is about 99 bytes when encoded
         # as JSON.
-        limit = self.env.max_send // 99
+        full_history_limit = self.env.max_send // 99
         cost = 0.1
-        self._history_lookups += 1
+        if latest_first:
+            self._recent_history_lookups += 1
+            cache = self._recent_history_cache
+        else:
+            limit = full_history_limit
+            self._history_lookups += 1
+            cache = self._history_cache
         try:
-            result = self._history_cache[hashX]
-            self._history_hits += 1
+            result = cache[hashX]
+            if latest_first:
+                self._recent_history_hits += 1
+            else:
+                self._history_hits += 1
         except KeyError:
-            result = await self.db.limited_history(hashX, limit=limit)
+            result = await self.db.limited_history(hashX, limit=limit, latest_first=latest_first)
             cost += 0.1 + len(result) * 0.001
-            if len(result) >= limit:
+            # Only the full-history path treats hitting the limit as an
+            # error: the truncated path intentionally returns the newest
+            # `limit` rows as a graceful degradation.
+            if not latest_first and len(result) >= limit:
                 result = RPCError(BAD_REQUEST, f'history too large', cost=cost)
-            self._history_cache[hashX] = result
+            cache[hashX] = result
 
         if isinstance(result, Exception):
             raise result
@@ -808,9 +831,9 @@ class SessionManager:
         if height_changed:
             await self._refresh_hsub_results(height)
             # Invalidate our history cache for touched hashXs
-            cache = self._history_cache
-            for hashX in set(cache).intersection(touched):
-                del cache[hashX]
+            for cache in (self._history_cache, self._recent_history_cache):
+                for hashX in set(cache).intersection(touched):
+                    del cache[hashX]
 
         for session in self.sessions:
             await self._task_group.spawn(session.notify, touched, height_changed)
@@ -1175,7 +1198,10 @@ class ElectrumX(SessionBase):
 
     async def confirmed_and_unconfirmed_history(self, hashX):
         # Note history is ordered but unconfirmed is unordered in e-s
-        history, cost = await self.session_mgr.limited_history(hashX)
+        # latest_first=True: confirmed tail only (earliest-first, limit entries).
+        # Return order unchanged: confirmed block first, then unordered mempool entries appended.
+        history, cost = await self.session_mgr.limited_history(
+            hashX, latest_first=True)
         self.bump_cost(cost)
         conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
                 for tx_hash, height in history]
