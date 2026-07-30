@@ -787,12 +787,15 @@ class SessionManager:
         return hex_hash
 
     async def limited_history(self, hashX, *, limit=1000, latest_first=False):
-        '''Returns (history, cost).  history is earliest-first
-        (tx_hash, height) tuples, or RPCError.
+        '''Returns a pair (history, cost).
+
+        History is a sorted list of (tx_hash, height) tuples, or an RPCError.
 
         latest_first=False: full history up to max_send//99; raises if too large
         (address_status / subscribe).  latest_first=True: newest `limit` entries
         (default 1000) for scripthash.get_history truncation.'''
+        # History DoS limit.  Each element of history is about 99 bytes when encoded
+        # as JSON.
         full_history_limit = self.env.max_send // 99
         cost = 0.1
         if latest_first:
@@ -1194,6 +1197,7 @@ class ElectrumX(SessionBase):
         return result
 
     async def confirmed_and_unconfirmed_history(self, hashX):
+        # Note history is ordered but unconfirmed is unordered in e-s
         # latest_first=True: confirmed tail only (earliest-first, limit entries).
         # Return order unchanged: confirmed block first, then unordered mempool entries appended.
         history, cost = await self.session_mgr.limited_history(
